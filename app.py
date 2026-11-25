@@ -1,19 +1,10 @@
 import re
-import numpy as np
 import streamlit as st
-from PIL import Image
-import easyocr
+from PIL import Image, ImageOps, ImageEnhance
+import pytesseract
 
-# Sayfa ayarları (Mobil uyumlu tasarım)
 st.set_page_config(page_title="VBG Klinik Asistan", page_icon="🩺", layout="centered")
 
-@st.cache_resource
-def load_ocr():
-    return easyocr.Reader(['tr', 'en'], gpu=False)
-
-reader = load_ocr()
-
-# Session State (Okunan değerleri hesaplayıcıya aktarmak için)
 if "son_veriler" not in st.session_state:
     st.session_state["son_veriler"] = {}
 
@@ -33,6 +24,21 @@ REFERANSLAR = {
     "Hct": {"min": 35.0, "max": 50.0, "kritik_alt": 22.0, "kritik_ust": 58.0, "birim": "%"},
     "Osmolalite": {"min": 271.0, "max": 303.0, "kritik_alt": 250.0, "kritik_ust": 320.0, "birim": "mOsm/kg"}
 }
+
+def gorselden_oku(image):
+    # RAM dostu görüntü iyileştirme (Sadece Pillow kullanır, sunucuyu yormaz)
+    gri = ImageOps.grayscale(image)
+    # Çok büyük telefon fotoğraflarını makul boyuta çek (Hız ve bellek için)
+    max_boyut = 1600
+    if max(gri.size) > max_boyut:
+        oran = max_boyut / float(max(gri.size))
+        yeni_boyut = (int(gri.size[0] * oran), int(gri.size[1] * oran))
+        gri = gri.resize(yeni_boyut, Image.Resampling.LANCZOS)
+    
+    # Kontrastı artır
+    kontrast = ImageEnhance.Contrast(gri).enhance(2.0)
+    metin = pytesseract.image_to_string(kontrast, lang="tur+eng")
+    return metin
 
 def veri_ayikla(ham_metin):
     bulunanlar = {}
@@ -57,12 +63,15 @@ def veri_ayikla(ham_metin):
         if eslesme:
             deger_str = next((g for g in eslesme.groups() if g is not None), None)
             if deger_str:
-                bulunanlar[param] = float(deger_str.replace(",", "."))
+                try:
+                    bulunanlar[param] = float(deger_str.replace(",", "."))
+                except ValueError:
+                    pass
     return bulunanlar
 
 def analiz_et(veriler, profil):
     if not veriler:
-        st.warning("⚠️ Metinden anlamlı kan gazı parametresi okunamadı. Fotoğraf net değilse değerleri 'Hızlı Manuel Giriş' sekmesinden girebilirsiniz.")
+        st.warning("⚠️ Fotoğraftan veya metinden kan gazı parametresi okunamadı. Monitör yansıması varsa daha yakından çekebilir veya 'Hızlı Manuel Giriş' sekmesini kullanabilirsiniz.")
         return
 
     st.session_state["son_veriler"] = veriler
@@ -118,7 +127,8 @@ def analiz_et(veriler, profil):
         if k < 3.5:
             aksiyonlar.append(f"**Hipokalemi (K: {k}):** 12 derivasyonlu EKG çek. Diüretik tedavisini gözden geçir. KBY/Nakil hastasına uygun hızda Oral veya IV Potasyum replasmanı planla. *(Aşağıdaki Doz Hesaplayıcıya aktarıldı)*")
         elif k > 5.0:
-            aksiyonlar.append(f"**Hiperkalemi (K: {k}):** Acil EKG çek. {'Kalsinörin inhibitörü (Takrolimus/Siklosporin) veya ACEi/ARB kaynaklı Tip 4 RTA açısından ilaç düzeylerini kontrol et. ' if 'Nakil' in profil else ''}K >= 5.5 ise Kalsiyum Glukonat, İnsülin-Dekstroz, Salbutamol, Potasyum bağlayıcı veya Diyaliz değerlendir.")
+            ek_not = "Kalsinörin inhibitörü (Takrolimus/Siklosporin) veya ACEi/ARB kaynaklı Tip 4 RTA açısından ilaç düzeylerini kontrol et. " if "Nakil" in profil else ""
+            aksiyonlar.append(f"**Hiperkalemi (K: {k}):** Acil EKG çek. {ek_not}K >= 5.5 ise Kalsiyum Glukonat, İnsülin-Dekstroz, Salbutamol, Potasyum bağlayıcı veya Diyaliz değerlendir.")
 
     ag = veriler.get("AG")
     laktat = veriler.get("Laktat")
@@ -134,7 +144,8 @@ def analiz_et(veriler, profil):
 
     hb = veriler.get("Hb")
     if hb is not None and hb < 10.0:
-        aksiyonlar.append(f"**Anemi (Hb: {hb}):** {'Post-op/cerrahi kanama, hemoliz veya EPO/demir eksikliği açısından tam kan ve retikülosit kontrol et.' if 'Nakil' in profil else 'Demir depoları (Ferritin, TSAT) ve EPO ihtiyacını değerlendir.'}")
+        hb_not = "Post-op/cerrahi kanama, hemoliz veya EPO/demir eksikliği açısından tam kan ve retikülosit kontrol et." if "Nakil" in profil else "Demir depoları (Ferritin, TSAT) ve EPO ihtiyacını değerlendir."
+        aksiyonlar.append(f"**Anemi (Hb: {hb}):** {hb_not}")
 
     st.divider()
     if acil_uyarilar:
@@ -174,11 +185,11 @@ with tab1:
     if aktif_gorsel:
         image = Image.open(aktif_gorsel)
         with st.spinner("Fotoğraf okunuyor ve analiz ediliyor..."):
-            img_np = np.array(image)
-            sonuclar = reader.readtext(img_np, detail=0)
-            okunan_metin = " ".join(sonuclar)
+            okunan_metin = gorselden_oku(image)
             veriler = veri_ayikla(okunan_metin)
             analiz_et(veriler, profil)
+            with st.expander("🔍 Fotoğraftan Okunan Ham Metni Gör"):
+                st.text(okunan_metin)
 
 with tab2:
     ham_metin = st.text_area("HBYS'den kopyaladığınız kan gazı sonucunu buraya yapıştırın:", height=150)
@@ -217,10 +228,9 @@ kilo = st.number_input("Hastanın Kilosu (kg):", min_value=20.0, max_value=250.0
 
 calc_tab1, calc_tab2 = st.tabs(["⚡ Potasyum (KCl) Hesaplayıcı", "🧪 Bikarbonat (NaHCO3) Hesaplayıcı"])
 
-# --- 1. POTASYUM HESAPLAYICI ---
 with calc_tab1:
     varsayilan_k = float(st.session_state["son_veriler"].get("K", 2.9))
-    if varsayilan_k > 6.0:
+    if varsayilan_k > 6.0 or varsayilan_k < 1.0:
         varsayilan_k = 2.9
 
     c1, c2 = st.columns(2)
@@ -234,12 +244,9 @@ with calc_tab1:
     if mevcut_k >= hedef_k:
         st.success(f"Mevcut potasyum ({mevcut_k} mmol/L) hedef değerin altında değil. Replasman gerekmiyor.")
     else:
-        # Klinik kural: Serum K'daki her 0.3 mmol/L düşüş yaklaşık 100 mEq total vücut açığına karşılık gelir.
-        # Ancak KBY/Nakil hastalarında böbrekten atılım kısıtlı olabileceği için temkinli replasman esastır.
         fark_k = hedef_k - mevcut_k
         tahmini_acik_meq = (fark_k / 0.3) * 100
         
-        # KBY hastalarında tek seferde/ilk 24 saatte verilecek güvenli replasman dozu
         if "KBY" in profil:
             onerilen_baslangic_meq = min(tahmini_acik_meq * 0.5, 40.0 if mevcut_k >= 3.0 else 60.0)
         else:
@@ -269,10 +276,9 @@ with calc_tab1:
         if "KBY" in profil:
             st.error("⚠️ **KBY Uyarısı:** Böbrek potasyum atılımı kısıtlı olduğu için 'rebound hiperkalemi' riski yüksektir. Dozun tamamını tek seferde yüklemeyin; ilk 2-3 ampul sonrası kontrol K görün.")
 
-# --- 2. BİKARBONAT HESAPLAYICI ---
 with calc_tab2:
     varsayilan_hco3 = float(st.session_state["son_veriler"].get("cHCO3", 16.0))
-    if varsayilan_hco3 > 30.0:
+    if varsayilan_hco3 > 30.0 or varsayilan_hco3 < 3.0:
         varsayilan_hco3 = 16.0
 
     b1, b2 = st.columns(2)
@@ -284,7 +290,6 @@ with calc_tab2:
     if mevcut_hco3 >= hedef_hco3:
         st.success(f"Mevcut bikarbonat ({mevcut_hco3} mmol/L) hedef değerin altında değil. IV replasman gerekmiyor.")
     else:
-        # Bikarbonat Açığı Formülü = 0.5 * Kilo * (Hedef HCO3 - Mevcut HCO3)
         tam_acik_meq = 0.5 * kilo * (hedef_hco3 - mevcut_hco3)
         ilk_24_saat_meq = tam_acik_meq * 0.5
         
